@@ -52,50 +52,63 @@ impl Parser {
         };
 
         let input = input.trim_start_matches(&exec).trim();
-        let raw_tokens = tokenize(&input);
+        let raw_tokens = tokenize(input);
         let mut flags = Vec::new();
         let mut args = Vec::new();
+        let flag_config = flag_config(&exec);
+        let mut stop_parsing_flags = false;
 
         for token in raw_tokens {
-            if token == "--help" {
-                flags.push(token);
+            if token.is_empty() {
                 continue;
             }
 
-            if token.starts_with("--") {
-                flags.push(token);
-                continue;
-            }
-
-            if token.starts_with('-') && token.len() > 1 {
-                let new_vec: Vec<String> = token
-                    .trim_start_matches('-')
-                    .chars()
-                    .map(|c| c.to_string())
-                    .collect();
-
-                if valid_flags(&new_vec) {
-                    flags.extend(new_vec);
-                } else {
-                    return Err(format!(
-                        "{}: invalid option -- '{}'\n",
-                        exec,
-                        token.trim_start_matches('-')
-                    ));
+            if let Some(config) = flag_config {
+                if !stop_parsing_flags && token == "--" {
+                    stop_parsing_flags = true;
+                    continue;
                 }
-            } else if !token.is_empty() {
-                args.push(token);
+
+                if config.allow_help && !stop_parsing_flags && token == "--help" {
+                    flags.push(token);
+                    continue;
+                }
+
+                if !stop_parsing_flags && token.starts_with('-') && token.len() > 1 {
+                    let group = token.trim_start_matches('-');
+                    if group.chars().all(|ch| config.allowed.contains(&ch)) {
+                        flags.extend(group.chars().map(|ch| ch.to_string()));
+                        continue;
+                    }
+
+                    return Err(format!("{}: invalid option -- '{}'\n", exec, group));
+                }
             }
+
+            args.push(token);
         }
 
-        Ok((
-            State::Exec,
-            Cmd {
-                exec,
-                flags,
-                args,
-            },
-        ))
+        Ok((State::Exec, Cmd { exec, flags, args }))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FlagConfig {
+    allow_help: bool,
+    allowed: &'static [char],
+}
+
+fn flag_config(command_name: &str) -> Option<FlagConfig> {
+    match command_name {
+        "ls" => Some(FlagConfig {
+            allow_help: true,
+            allowed: &['l', 'a', 'F'],
+        }),
+        "rm" => Some(FlagConfig {
+            allow_help: false,
+            allowed: &['r', 'R'],
+        }),
+        _ => None,
     }
 }
 
@@ -110,14 +123,14 @@ fn tokenize(input: &str) -> Vec<String> {
     while let Some(&ch) = chars.peek() {
         match ch {
             '\\' => {
-                chars.next(); // consume '\'
+                chars.next();
                 if let Some(&escaped_char) = chars.peek() {
                     current.push(escaped_char);
-                    chars.next(); // consume escaped char
+                    chars.next();
                 }
             }
             '\'' => {
-                chars.next(); // consume quote
+                chars.next();
                 if !in_double_quote {
                     in_single_quote = !in_single_quote;
                 } else {
@@ -125,7 +138,7 @@ fn tokenize(input: &str) -> Vec<String> {
                 }
             }
             '"' => {
-                chars.next(); // consume quote
+                chars.next();
                 if !in_single_quote {
                     in_double_quote = !in_double_quote;
                 } else {
@@ -162,8 +175,4 @@ fn tokenize(input: &str) -> Vec<String> {
     }
 
     tokens
-}
-
-fn valid_flags(_args: &Vec<String>) -> bool {
-    true
 }

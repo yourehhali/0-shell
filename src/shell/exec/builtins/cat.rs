@@ -4,19 +4,28 @@ use std::{fs, io};
 
 pub fn cat(_shell: &mut Shell, cmd: &Cmd) {
     if cmd.args.is_empty() {
-        let stdin = io::stdin();
-        loop {
-            let mut input = String::new();
-            stdin.read_line(&mut input).unwrap();
-            print!("{}", input);
+        let _ = copy_stdin_to_stdout();
+        return;
+    }
+
+    for file in &cmd.args {
+        if file == "-" {
+            let _ = copy_stdin_to_stdout();
+            continue;
         }
-    } else {
-        for file in &cmd.args {
-            let content = fs::read_to_string(file);
-            match content {
-                Ok(data) => print!("{}", data),
-                Err(_) => println!("cat: {}: No such file or directory", file),
-            };
+
+        match fs::File::open(file) {
+            Ok(mut f) => {
+                let mut out = io::stdout().lock();
+                let _ = io::copy(&mut f, &mut out);
+            }
+            Err(_) => eprintln!("cat: {}: No such file or directory", file),
         }
     }
+}
+
+fn copy_stdin_to_stdout() -> io::Result<u64> {
+    let mut stdin = io::stdin().lock();
+    let mut stdout = io::stdout().lock();
+    io::copy(&mut stdin, &mut stdout)
 }

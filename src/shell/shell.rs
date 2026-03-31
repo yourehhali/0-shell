@@ -6,20 +6,24 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::io::{stdin, stdout};
+use std::io::stdout;
 use std::path::{Path, PathBuf};
+
+use crossterm::cursor::MoveToColumn;
+use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::terminal::{Clear, ClearType};
+use crossterm::{event, execute};
 
 use crate::shell::State;
 use crate::shell::exec::helper::get_builtins;
 
 impl Shell {
     pub fn new() -> Shell {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         Shell {
-            pid: std::process::id(),
-            cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-            env: env::vars().collect(),
+            cwd: cwd.clone(),
+            prev_cwd: cwd,
             history: Vec::new(),
-            last_status: 0,
 
             prompt: "$ ".to_string(),
             builtins: get_builtins(),
@@ -51,11 +55,11 @@ impl Shell {
 
         let git_branch = get_git_branch(&self.cwd);
         let branch_part = git_branch.map_or(String::new(), |b| {
-            format!(" \x1b[31mgit:(\x1b[36m{}\x1b[31m)", b)
+            format!(" \x1b[96mgit:(\x1b[92m{}\x1b[96m)", b)
         });
 
         self.prompt = format!(
-            "\x1b[1m \x1b[38;5;208m{}{} \x1b[38;5;208m➜\x1b[0m ",
+            "➜ \x1b[1m \x1b[38;5;208m{}{} \x1b[38;5;208m$\x1b[0m ",
             display_name, branch_part
         );
     }
@@ -64,65 +68,207 @@ impl Shell {
         self.update_prompt();
         let parser = Parser::new();
         let executor = Executor::new();
-        let stdin = stdin();
         let mut input = String::new();
 
         print_banner();
 
         loop {
-            match &self.state {
-                State::Exec => continue,
-                State::Ready => {
-                    print!("{}", self.prompt);
-                    stdout().flush().unwrap();
-                    input = String::new();
-                }
-                State::Quote(typ) => {
-                    print!("{}> ", typ);
-                    self.state = State::Ready;
-                    stdout().flush().unwrap();
-                }
-                State::BackNewLine => {
-                    print!("> ");
-                    self.state = State::Ready;
-                    stdout().flush().unwrap();
-                }
-            };
-
-            if input.len() > 0 {
-                let mut temp_buffer = String::new();
-                match stdin.read_line(&mut temp_buffer) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-                input = format!("{}{}", input, temp_buffer);
-            } else {
-                match stdin.read_line(&mut input) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
+            if matches!(self.state, State::Exec) {
+                self.state = State::Ready;
             }
 
-            let input = input.trim();
-            let state = parser.scan_command(&input.trim());
+            let prompt = match &self.state {
+                State::Ready => self.prompt.as_str(),
+                State::Quote(typ) => {
+                    if typ == "dquote" {
+                        "dquote> "
+                    } else {
+                        "quote> "
+                    }
+                }
+                State::BackNewLine => "> ",
+                State::Exec => self.prompt.as_str(),
+            };
+
+            let Some(line) = read_line_with_editing(prompt, &self.history) else {
+                break;
+            };
+
+            if !input.is_empty() {
+                input.push('\n');
+            }
+            input.push_str(&line);
+
+            let state = parser.scan_command(&input);
             match state {
                 State::Exec => match parser.parse_command(&input) {
-                    Ok((state, cmd)) => {
-                        match state {
-                            State::Exec => {
-                                self.state = State::Exec;
-                                executor.execute_command(&mut self, &cmd);
+                    Ok((state, cmd)) => match state {
+                        State::Exec => {
+                            self.state = State::Exec;
+                            if !input.trim().is_empty() {
+                                self.history.push(input.clone());
                             }
-                            _ => self.state = state,
+                            executor.execute_command(&mut self, &cmd);
+                            input.clear();
                         }
-                    }
+                        _ => self.state = state,
+                    },
                     Err(err) => print!("{err}"),
                 },
                 _ => self.state = state,
             };
         }
+    }
+}
+
+fn read_line_with_editing(prompt: &str, history: &[String]) -> Option<String> {
+    let mut stdout = stdout();
+    if execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine)).is_err() {
+        return None;
+    }
+    print!("{prompt}");
+    let _ = stdout.flush();
+
+    let _raw_mode = RawModeGuard::new()?;
+
+    let mut buffer: Vec<char> = Vec::new();
+    let mut cursor = 0usize;
+
+    let mut history_index: Option<usize> = None;
+    let mut history_draft: Vec<char> = Vec::new();
+
+    loop {
+        let ev = event::read().ok()?;
+        let Event::Key(key) = ev else {
+            continue;
+        };
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => {
+                    if buffer.is_empty() {
+                        let _ = execute!(stdout, MoveToColumn(0));
+                        println!();
+                        return None;
+                    }
+                }
+                KeyCode::Char('c') => {
+                    let _ = execute!(stdout, MoveToColumn(0));
+                    println!();
+                    return Some(String::new());
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
+            KeyCode::Enter => {
+                let _ = execute!(stdout, MoveToColumn(0));
+                println!();
+                return Some(buffer.iter().collect());
+            }
+            KeyCode::Char(ch) => {
+                buffer.insert(cursor, ch);
+                cursor += 1;
+            }
+            KeyCode::Backspace => {
+                if cursor > 0 {
+                    cursor -= 1;
+                    buffer.remove(cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if cursor < buffer.len() {
+                    buffer.remove(cursor);
+                }
+            }
+            KeyCode::Left => {
+                cursor = cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                if cursor < buffer.len() {
+                    cursor += 1;
+                }
+            }
+            KeyCode::Home => cursor = 0,
+            KeyCode::End => cursor = buffer.len(),
+            KeyCode::Up => {
+                if history.is_empty() {
+                    continue;
+                }
+
+                if history_index.is_none() {
+                    history_draft = buffer.clone();
+                }
+
+                let next = match history_index {
+                    None => history.len().saturating_sub(1),
+                    Some(i) => i.saturating_sub(1),
+                };
+                history_index = Some(next);
+                buffer = history[next].chars().collect();
+                cursor = buffer.len();
+            }
+            KeyCode::Down => {
+                let Some(i) = history_index else {
+                    continue;
+                };
+
+                if i + 1 >= history.len() {
+                    history_index = None;
+                    buffer = history_draft.clone();
+                    cursor = buffer.len();
+                } else {
+                    let next = i + 1;
+                    history_index = Some(next);
+                    buffer = history[next].chars().collect();
+                    cursor = buffer.len();
+                }
+            }
+            _ => {}
+        }
+
+        let prompt_len = visible_len(prompt);
+        let current_text: String = buffer.iter().collect();
+        if execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine)).is_err() {
+            return None;
+        }
+        print!("{prompt}{current_text}");
+        let _ = execute!(stdout, MoveToColumn((prompt_len + cursor) as u16));
+        let _ = stdout.flush();
+    }
+}
+
+fn visible_len(s: &str) -> usize {
+    let mut len = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        len += 1;
+    }
+    len
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Option<Self> {
+        crossterm::terminal::enable_raw_mode().ok()?;
+        Some(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
@@ -144,8 +290,7 @@ fn load_banner_font() -> HashMap<char, Vec<String>> {
     let mut font: HashMap<char, Vec<String>> = HashMap::new();
 
     let mut iter = data.lines();
-    loop {
-        let Some(header) = iter.next() else { break };
+    while let Some(header) = iter.next() {
         if header.is_empty() {
             continue;
         }
@@ -200,26 +345,21 @@ fn render_banner_text(text: &str, font: &HashMap<char, Vec<String>>) -> Vec<Stri
 }
 
 fn get_git_branch(cwd: &Path) -> Option<String> {
-    // Find the .git directory, which might be a folder or a file (in case of submodules or worktrees)
     let git_path = find_git_dir(cwd)?;
 
     let head_path = git_path.join("HEAD");
 
     let head_content = fs::read_to_string(head_path).ok()?;
 
-    // Typical content:
-    // ref: refs/heads/main
     if head_content.starts_with("ref: ") {
         let ref_path = head_content.trim_start_matches("ref: ").trim();
         let branch_name = ref_path.rsplit('/').next()?;
         Some(branch_name.to_string())
     } else {
-        // Detached HEAD or commit hash, just return first 7 chars as a short SHA
         Some(head_content.trim().chars().take(7).collect())
     }
 }
 
-// Recursively look for .git folder
 fn find_git_dir(start: &Path) -> Option<PathBuf> {
     let mut current = start;
 
@@ -228,13 +368,10 @@ fn find_git_dir(start: &Path) -> Option<PathBuf> {
         if candidate.is_dir() {
             return Some(candidate);
         }
-        // Sometimes .git is a file pointing to another git dir (git worktrees etc)
         if candidate.is_file() {
-            // Read the gitdir path inside the file
             if let Ok(contents) = fs::read_to_string(&candidate) {
-                // Usually something like: gitdir: /path/to/actual/git/dir
-                if contents.starts_with("gitdir: ") {
-                    let path_str = contents["gitdir: ".len()..].trim();
+                if let Some(stripped) = contents.strip_prefix("gitdir: ") {
+                    let path_str = stripped.trim();
                     let gitdir_path = if Path::new(path_str).is_absolute() {
                         PathBuf::from(path_str)
                     } else {

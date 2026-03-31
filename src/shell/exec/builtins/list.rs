@@ -1,4 +1,7 @@
 use chrono::{DateTime, Duration, Local};
+use crossterm::terminal;
+use libc::{c_char, gid_t, passwd, size_t, uid_t};
+use std::ffi::CStr;
 use std::fs;
 use std::fs::Metadata;
 use std::os::unix::fs::FileTypeExt;
@@ -6,7 +9,6 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use users::{get_group_by_gid, get_user_by_uid};
 
 use crate::shell::Shell;
 use crate::shell::parse::Cmd;
@@ -27,14 +29,16 @@ pub fn ls(_shell: &mut Shell, cmd: &Cmd) {
             "a" | "-a" => options.show_hidden = true,
             "F" | "-F" => options.f_type = true,
             "--help" => {
-                eprintln!("Usage: ls [OPTION]... [FILE]...\nList information about the FILEs (the current directory by default).\n\nOptions:\n  -l      use a long listing format\n  -a      do not ignore entries starting with .\n  -F      append indicator (one of */=>@|) to entries\n  --help  display this help and exit");
+                eprintln!(
+                    "Usage: ls [OPTION]... [FILE]...\nList information about the FILEs (the current directory by default).\n\nOptions:\n  -l      use a long listing format\n  -a      do not ignore entries starting with .\n  -F      append indicator (one of */=>@|) to entries\n  --help  display this help and exit"
+                );
                 return;
             }
             _ => {}
         }
     }
 
-    let mut paths: Vec<PathBuf> = if cmd.args.is_empty() {
+    let paths: Vec<PathBuf> = if cmd.args.is_empty() {
         vec![PathBuf::from(".")]
     } else {
         cmd.args.iter().map(PathBuf::from).collect()
@@ -59,10 +63,23 @@ pub fn ls(_shell: &mut Shell, cmd: &Cmd) {
         }
     }
 
+    files.sort_by(|a, b| compare_names(&path_sort_name(a), &path_sort_name(b)));
+    directories.sort_by(|a, b| compare_names(&path_sort_name(a), &path_sort_name(b)));
+
     let more_paths = directories.len() > 1 || (!files.is_empty() && !directories.is_empty());
 
-    for file in &files {
-        list_single(file, options);
+    if options.long_format {
+        for file in &files {
+            list_single(file, options);
+        }
+    } else {
+        let mut rendered = Vec::new();
+        for file in &files {
+            if let Some(item) = render_single(file, options) {
+                rendered.push(item);
+            }
+        }
+        print_inline(&rendered);
     }
 
     for (i, dir) in directories.iter().enumerate() {
@@ -71,8 +88,6 @@ pub fn ls(_shell: &mut Shell, cmd: &Cmd) {
         }
         list_directory(dir, options, more_paths);
     }
-
-    paths.clear();
 }
 
 fn list_single(path: &Path, options: LsOptions) {
@@ -92,11 +107,21 @@ fn list_single(path: &Path, options: LsOptions) {
     if options.long_format {
         let widths = MaxWidths::from_entries(&[(name.clone(), meta.clone(), path.to_path_buf())]);
         if let Some(line) = format_entry(&name, &meta, path, options, &widths) {
-            print!("{}", line);
+            println!("{line}");
         }
     } else if let Some(line) = format_entry(&name, &meta, path, options, &MaxWidths::default()) {
-        println!("{}", line.trim_end());
+        println!("{line}");
     }
+}
+
+fn render_single(path: &Path, options: LsOptions) -> Option<String> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+
+    format_entry(&name, &meta, path, options, &MaxWidths::default())
 }
 
 fn list_directory(path: &Path, options: LsOptions, more_paths: bool) {
@@ -143,24 +168,153 @@ fn list_directory(path: &Path, options: LsOptions, more_paths: bool) {
         entries.push((name, meta, item.path()));
     }
 
-    entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    entries.sort_by(|a, b| compare_names(&a.0, &b.0));
 
     if options.long_format {
-        println!("total {}", total_blocks / 2);
+        println!("total {}", display_total_blocks(total_blocks));
         let widths = MaxWidths::from_entries(&entries);
         for (name, meta, p) in entries {
             if let Some(line) = format_entry(&name, &meta, &p, options, &widths) {
-                print!("{}", line);
+                println!("{line}");
             }
         }
     } else {
         let widths = MaxWidths::default();
+        let mut rendered = Vec::new();
         for (name, meta, p) in entries {
             if let Some(line) = format_entry(&name, &meta, &p, options, &widths) {
-                println!("{}", line.trim_end());
+                rendered.push(line);
             }
         }
+        print_inline(&rendered);
     }
+}
+
+fn print_inline(items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    print_columns(items);
+}
+
+fn print_columns(items: &[String]) {
+    let term_width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+
+    let max_item_width = items.iter().map(|s| visible_len_ansi(s)).max().unwrap_or(0);
+
+    let col_width = (max_item_width + 2).max(1);
+    let cols = (term_width / col_width).max(1);
+    let rows = items.len().div_ceil(cols);
+
+    for row in 0..rows {
+        let mut line = String::new();
+        for col in 0..cols {
+            let idx = col * rows + row;
+            if idx >= items.len() {
+                continue;
+            }
+
+            let item = &items[idx];
+            if col + 1 == cols || idx + rows >= items.len() {
+                line.push_str(item);
+            } else {
+                let padding = col_width.saturating_sub(visible_len_ansi(item));
+                line.push_str(item);
+                line.push_str(&" ".repeat(padding));
+            }
+        }
+        println!("{line}");
+    }
+}
+
+fn visible_len_ansi(s: &str) -> usize {
+    let mut len = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        len += 1;
+    }
+    len
+}
+
+fn compare_names(a: &str, b: &str) -> std::cmp::Ordering {
+    a.cmp(b)
+}
+
+fn path_sort_name(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn user_name(uid: u32) -> Option<String> {
+    let mut pwd: passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut passwd = std::ptr::null_mut();
+
+    let buf_size = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let buf_size = if buf_size <= 0 {
+        16_384
+    } else {
+        buf_size as usize
+    };
+    let mut buf = vec![0u8; buf_size];
+
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid as uid_t,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len() as size_t,
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
+        return None;
+    }
+
+    unsafe { CStr::from_ptr(pwd.pw_name) }
+        .to_str()
+        .ok()
+        .map(|s| s.to_string())
+}
+
+fn group_name(gid: u32) -> Option<String> {
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::group = std::ptr::null_mut();
+
+    let buf_size = unsafe { libc::sysconf(libc::_SC_GETGR_R_SIZE_MAX) };
+    let buf_size = if buf_size <= 0 {
+        16_384
+    } else {
+        buf_size as usize
+    };
+    let mut buf = vec![0u8; buf_size];
+
+    let rc = unsafe {
+        libc::getgrgid_r(
+            gid as gid_t,
+            &mut grp,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len() as size_t,
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || grp.gr_name.is_null() {
+        return None;
+    }
+
+    unsafe { CStr::from_ptr(grp.gr_name) }
+        .to_str()
+        .ok()
+        .map(|s| s.to_string())
 }
 
 #[derive(Default)]
@@ -179,15 +333,13 @@ impl MaxWidths {
         for (_name, meta, path) in items {
             w.links = w.links.max(meta.nlink().to_string().len());
 
-            let user = get_user_by_uid(meta.uid())
-                .map(|u| u.name().to_string_lossy().len())
-                .unwrap_or_else(|| meta.uid().to_string().len());
-            w.user = w.user.max(user);
+            let user_len = user_name(meta.uid())
+                .map_or_else(|| meta.uid().to_string().len(), |name| name.len());
+            w.user = w.user.max(user_len);
 
-            let group = get_group_by_gid(meta.gid())
-                .map(|g| g.name().to_string_lossy().len())
-                .unwrap_or_else(|| meta.gid().to_string().len());
-            w.group = w.group.max(group);
+            let group_len = group_name(meta.gid())
+                .map_or_else(|| meta.gid().to_string().len(), |name| name.len());
+            w.group = w.group.max(group_len);
 
             let size = size_string(meta).len();
             w.size = w.size.max(size);
@@ -226,38 +378,33 @@ fn format_entry(
         '-'
     };
 
-    let (color, indicator) = if file_type.is_symlink() {
-        ("\x1b[1;36m", "@")
+    let indicator = if file_type.is_symlink() {
+        "@"
     } else if file_type.is_dir() {
-        ("\x1b[1;34m", "/")
+        "/"
     } else if meta.permissions().mode() & 0o111 != 0 {
-        ("\x1b[1;32m", "*")
+        "*"
     } else if file_type.is_fifo() {
-        ("\x1b[1;33m", "|")
+        "|"
     } else if file_type.is_socket() {
-        ("\x1b[1;35m", "=")
+        "="
     } else {
-        ("\x1b[0m", "")
+        ""
     };
-    let reset = "\x1b[0m";
 
     if options.long_format {
         let perms = format_permissions(meta.permissions().mode(), path);
         let links = meta.nlink();
-        let user = get_user_by_uid(meta.uid())
-            .map(|u| u.name().to_string_lossy().into_owned())
-            .unwrap_or_else(|| meta.uid().to_string());
-        let group = get_group_by_gid(meta.gid())
-            .map(|g| g.name().to_string_lossy().into_owned())
-            .unwrap_or_else(|| meta.gid().to_string());
+        let user = user_name(meta.uid()).unwrap_or_else(|| meta.uid().to_string());
+        let group = group_name(meta.gid()).unwrap_or_else(|| meta.gid().to_string());
         let size = size_string(meta);
         let time = time_string(meta);
 
-        let mut filename_display = format!("{}{}{}", color, name, reset);
-        if file_type.is_symlink() {
-            if let Ok(target) = fs::read_link(path) {
-                filename_display = format!("{}{}{} -> {}", color, name, reset, target.display());
-            }
+        let mut filename_display = name.to_string();
+        if file_type.is_symlink()
+            && let Ok(target) = fs::read_link(path)
+        {
+            filename_display = format!("{} -> {}", name, target.display());
         }
 
         let maybe_indicator = if options.f_type && indicator == "@" {
@@ -269,7 +416,7 @@ fn format_entry(
         };
 
         Some(format!(
-            "{}{:<perm_w$} {:>links_w$} {:<user_w$} {:<group_w$} {:>size_w$} {:>time_w$} {}{}\n",
+            "{}{:<perm_w$}  {:>links_w$} {:<user_w$}  {:<group_w$}  {:>size_w$} {:>time_w$} {}{}",
             file_type_char,
             perms,
             links,
@@ -286,12 +433,10 @@ fn format_entry(
             size_w = widths.size,
             time_w = widths.time,
         ))
+    } else if options.f_type {
+        Some(format!("{}{}", name, indicator))
     } else {
-        if options.f_type {
-            Some(format!("{}{}{}{} ", color, name, reset, indicator))
-        } else {
-            Some(format!("{}{}{} ", color, name, reset))
-        }
+        Some(name.to_string())
     }
 }
 
@@ -315,25 +460,27 @@ fn format_permissions(mode: u32, _path: &Path) -> String {
     }
 
     if mode & 0o4000 != 0 {
-        res.replace_range(
-            2..3,
-            if &res[2..3] == "x" { "s" } else { "S" },
-        );
+        res.replace_range(2..3, if &res[2..3] == "x" { "s" } else { "S" });
     }
     if mode & 0o2000 != 0 {
-        res.replace_range(
-            5..6,
-            if &res[5..6] == "x" { "s" } else { "S" },
-        );
+        res.replace_range(5..6, if &res[5..6] == "x" { "s" } else { "S" });
     }
     if mode & 0o1000 != 0 {
-        res.replace_range(
-            8..9,
-            if &res[8..9] == "x" { "t" } else { "T" },
-        );
+        res.replace_range(8..9, if &res[8..9] == "x" { "t" } else { "T" });
     }
 
     res
+}
+
+fn display_total_blocks(blocks_512: u64) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        blocks_512
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        blocks_512 / 2
+    }
 }
 
 fn size_string(meta: &Metadata) -> String {

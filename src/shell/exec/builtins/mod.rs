@@ -1,8 +1,8 @@
 pub mod base;
-pub mod cd;
-pub mod list;
 pub mod cat;
+pub mod cd;
 pub mod cp;
-pub mod rm;
-pub mod mv;
+pub mod list;
 pub mod mkdir;
+pub mod mv;
+pub mod rm;

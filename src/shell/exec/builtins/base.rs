@@ -1,7 +1,7 @@
 use crate::shell::Shell;
 use crate::shell::parse::Cmd;
 use std::collections::HashMap;
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 
 pub fn exit(_shell: &mut Shell, cmd: &Cmd) {
     print_exit_banner();
@@ -15,7 +15,38 @@ pub fn exit(_shell: &mut Shell, cmd: &Cmd) {
 }
 
 pub fn echo(_shell: &mut Shell, cmd: &Cmd) {
-    println!("{}", cmd.args.join(" "));
+    let mut print_newline = true;
+
+    let mut consumed = 0usize;
+    for arg in cmd.args.iter().map(String::as_str) {
+        if is_no_newline_flag(arg) {
+            print_newline = false;
+            consumed += 1;
+        } else {
+            break;
+        }
+    }
+
+    let out = cmd
+        .args
+        .iter()
+        .skip(consumed)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if print_newline {
+        println!("{out}");
+    } else {
+        print!("{out}");
+        let _ = stdout().flush();
+    }
+}
+
+fn is_no_newline_flag(arg: &str) -> bool {
+    let Some(rest) = arg.strip_prefix('-') else {
+        return false;
+    };
+    !rest.is_empty() && rest.chars().all(|c| c == 'n')
 }
 
 pub fn pwd(shell: &mut Shell, _cmd: &Cmd) {
@@ -44,8 +75,7 @@ fn load_banner_font() -> HashMap<char, Vec<String>> {
     let mut font: HashMap<char, Vec<String>> = HashMap::new();
 
     let mut iter = data.lines();
-    loop {
-        let Some(header) = iter.next() else { break };
+    while let Some(header) = iter.next() {
         if header.is_empty() {
             continue;
         }
